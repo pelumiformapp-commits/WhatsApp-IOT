@@ -1,55 +1,51 @@
 const express = require('express');
-const { Client, LocalAuth } = require('whatsapp-web.js');
+const { default: makeWASocket, useMultiFileAuthState, DisconnectReason } = require('@whiskeysockets/baileys');
 const qrcode = require('qrcode-terminal');
 const axios = require('axios');
-const { execSync } = require('child_process');
 
-// Dummy server so Railway sees the app as "alive"
 const app = express();
 app.get('/', (req, res) => res.send('Bot running'));
 app.listen(process.env.PORT || 3000);
 
-// Find Chromium installed by Railway
-const chromiumPath = execSync('which chromium').toString().trim();
-
-// WhatsApp client
-const client = new Client({
-  authStrategy: new LocalAuth(),
-  puppeteer: {
-    headless: true,
-    executablePath: chromiumPath,
-    args: [
-      '--no-sandbox',
-      '--disable-setuid-sandbox',
-      '--disable-dev-shm-usage',
-      '--disable-accelerated-2d-canvas',
-      '--no-first-run',
-      '--no-zygote',
-      '--single-process',
-      '--disable-gpu'
-    ]
-  }
-});
-
-client.on('qr', qr => {
-  console.log('Scan this QR code with WhatsApp:');
-  qrcode.generate(qr, { small: true });
-});
-
-client.on('ready', () => console.log('WhatsApp bot is ready!'));
-
 const RELAY_URL = 'https://pelumidayo43-art-whatsapp-iot-gateway.onrender.com/api/relay_status';
 
-client.on('message', async msg => {
-  const text = msg.body.toLowerCase().trim();
+async function startBot() {
+  const { state, saveCreds } = await useMultiFileAuthState('auth_info');
 
-  if (text === 'relay on') {
-    await axios.post(RELAY_URL, { status: 1 });
-    msg.reply('✅ Relay turned ON');
-  } else if (text === 'relay off') {
-    await axios.post(RELAY_URL, { status: 0 });
-    msg.reply('✅ Relay turned OFF');
-  }
-});
+  const sock = makeWASocket({ auth: state });
 
-client.initialize();
+  sock.ev.on('creds.update', saveCreds);
+
+  sock.ev.on('connection.update', (update) => {
+    const { connection, lastDisconnect, qr } = update;
+    if (qr) {
+      console.log('Scan this QR code with WhatsApp:');
+      qrcode.generate(qr, { small: true });
+    }
+    if (connection === 'close') {
+      const shouldReconnect = lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
+      console.log('Connection closed, reconnecting:', shouldReconnect);
+      if (shouldReconnect) startBot();
+    } else if (connection === 'open') {
+      console.log('WhatsApp bot is ready!');
+    }
+  });
+
+  sock.ev.on('messages.upsert', async ({ messages }) => {
+    const msg = messages[0];
+    if (!msg.message || msg.key.fromMe) return;
+
+    const text = (msg.message.conversation || msg.message.extendedTextMessage?.text || '').toLowerCase().trim();
+    const from = msg.key.remoteJid;
+
+    if (text === 'relay on') {
+      await axios.post(RELAY_URL, { status: 1 });
+      await sock.sendMessage(from, { text: '✅ Relay turned ON' });
+    } else if (text === 'relay off') {
+      await axios.post(RELAY_URL, { status: 0 });
+      await sock.sendMessage(from, { text: '✅ Relay turned OFF' });
+    }
+  });
+}
+
+startBot();
